@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -208,6 +209,197 @@ def _apply_data_filters(
     return out
 
 
+def _aggregate_kpis(fr: pd.DataFrame) -> dict[str, float] | None:
+    if fr.empty:
+        return None
+    cost = float(fr["cost"].sum())
+    rev = float(fr["revenue"].sum())
+    conv = float(fr["conversions"].sum())
+    roas = rev / cost if cost else 0.0
+    cpa = cost / conv if conv else float("nan")
+    return {"cost": cost, "revenue": rev, "roas": roas, "cpa": cpa}
+
+
+def _pct_delta_str(curr: float, prev: float) -> str | None:
+    if prev == 0:
+        return None
+    return f"{(curr - prev) / prev * 100:+.1f}%"
+
+
+def _previous_period_range(
+    date_start: date, date_end: date, data_min: date
+) -> tuple[date, date] | None:
+    n_days = (date_end - date_start).days + 1
+    prev_end = date_start - timedelta(days=1)
+    if prev_end < data_min:
+        return None
+    prev_start = prev_end - timedelta(days=n_days - 1)
+    prev_start = max(prev_start, data_min)
+    if prev_start > prev_end:
+        return None
+    return prev_start, prev_end
+
+
+def _daily_trend_metrics(fr: pd.DataFrame) -> pd.DataFrame:
+    d = fr.assign(_d=fr["date"].dt.date)
+    g = d.groupby("_d", as_index=False).agg(
+        cost=("cost", "sum"),
+        revenue=("revenue", "sum"),
+        conversions=("conversions", "sum"),
+    )
+    g["roas"] = g["revenue"] / g["cost"].replace(0, pd.NA)
+    g["cpa"] = g["cost"] / g["conversions"].replace(0, pd.NA)
+    g = g.rename(columns={"_d": "날짜"})
+    return g
+
+
+def render_tab_main_dashboard(
+    filtered: pd.DataFrame,
+    prev_filtered: pd.DataFrame,
+) -> None:
+    cur = _aggregate_kpis(filtered)
+    prev = _aggregate_kpis(prev_filtered) if not prev_filtered.empty else None
+
+    st.subheader("핵심 지표")
+    c1, c2, c3, c4 = st.columns(4)
+    if cur is None:
+        st.info("표시할 데이터가 없습니다.")
+        return
+
+    d_cost = _pct_delta_str(cur["cost"], prev["cost"]) if prev else None
+    d_rev = _pct_delta_str(cur["revenue"], prev["revenue"]) if prev else None
+    d_roas = (
+        _pct_delta_str(cur["roas"], prev["roas"])
+        if prev and prev["cost"] > 0 and cur["cost"] > 0
+        else None
+    )
+    d_cpa = None
+    if (
+        prev
+        and pd.notna(cur["cpa"])
+        and pd.notna(prev["cpa"])
+        and prev["cpa"] != 0
+    ):
+        d_cpa = _pct_delta_str(cur["cpa"], prev["cpa"])
+
+    c1.metric(
+        "광고비",
+        f"{int(cur['cost']):,}원",
+        delta=d_cost,
+        delta_color="inverse",
+    )
+    c2.metric(
+        "매출",
+        f"{int(cur['revenue']):,}원",
+        delta=d_rev,
+        delta_color="normal",
+    )
+    c3.metric(
+        "ROAS",
+        f"{cur['roas']:.2f}",
+        delta=d_roas,
+        delta_color="normal",
+    )
+    c4.metric(
+        "CPA",
+        f"{int(cur['cpa']):,}원" if pd.notna(cur["cpa"]) else "—",
+        delta=d_cpa,
+        delta_color="inverse",
+    )
+
+    st.subheader("추이")
+    trend_choice = st.radio(
+        "일별 추이 지표",
+        ["광고비", "매출", "ROAS", "CPA"],
+        horizontal=True,
+        key="dash_trend_metric",
+    )
+    daily = _daily_trend_metrics(filtered)
+    if daily.empty:
+        st.info("추이를 그릴 일별 데이터가 없습니다.")
+    else:
+        col_y = {"광고비": "cost", "매출": "revenue", "ROAS": "roas", "CPA": "cpa"}[trend_choice]
+        y_title = {"광고비": "광고비 (원)", "매출": "매출 (원)", "ROAS": "ROAS", "CPA": "CPA (원)"}[
+            trend_choice
+        ]
+        fig_line = go.Figure()
+        fig_line.add_trace(
+            go.Scatter(
+                x=daily["날짜"],
+                y=daily[col_y],
+                mode="lines+markers",
+                name=trend_choice,
+                connectgaps=False,
+            )
+        )
+        if trend_choice == "ROAS":
+            fig_line.add_hline(
+                y=2.0,
+                line_dash="dash",
+                line_color="rgba(120,120,120,0.9)",
+                annotation_text="손익분기 ROAS 2.0 (200%)",
+                annotation_position="right",
+            )
+        fig_line.update_layout(
+            margin=dict(l=8, r=8, t=32, b=8),
+            yaxis_title=y_title,
+            xaxis_title="날짜",
+            showlegend=False,
+            height=400,
+        )
+        st.plotly_chart(fig_line, use_container_width=True)
+
+    st.subheader("채널 구성")
+    col_d, col_b = st.columns(2)
+    ch_cost = filtered.groupby("channel", as_index=False)["cost"].sum()
+    ch_agg = filtered.groupby("channel", as_index=False).agg(
+        cost=("cost", "sum"),
+        revenue=("revenue", "sum"),
+    )
+    ch_agg["roas"] = ch_agg["revenue"] / ch_agg["cost"].replace(0, pd.NA)
+
+    with col_d:
+        if ch_cost["cost"].sum() > 0:
+            fig_pie = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=ch_cost["channel"],
+                        values=ch_cost["cost"],
+                        hole=0.5,
+                        textinfo="percent+label",
+                        textposition="auto",
+                    )
+                ]
+            )
+            fig_pie.update_layout(
+                title="채널별 광고비 비중",
+                margin=dict(l=8, r=8, t=40, b=8),
+                showlegend=False,
+                height=380,
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.caption("도넛 차트를 그릴 광고비가 없습니다.")
+
+    with col_b:
+        fig_roas_bar = go.Figure(
+            go.Bar(
+                x=ch_agg["channel"],
+                y=ch_agg["roas"],
+                marker_color="#636EFA",
+            )
+        )
+        fig_roas_bar.update_layout(
+            title="채널별 ROAS",
+            yaxis_title="ROAS",
+            xaxis_title="채널",
+            margin=dict(l=8, r=8, t=40, b=8),
+            height=380,
+        )
+        fig_roas_bar.add_hline(y=2.0, line_dash="dash", line_color="rgba(120,120,120,0.8)")
+        st.plotly_chart(fig_roas_bar, use_container_width=True)
+
+
 def render_dashboard(df: pd.DataFrame) -> None:
     st.title("마케팅 성과 대시보드")
 
@@ -260,11 +452,28 @@ def render_dashboard(df: pd.DataFrame) -> None:
         cpa_max=cpa_max,
     )
 
+    prev_range = _previous_period_range(date_start, date_end, min_d)
+    if prev_range is None:
+        prev_filtered = df.iloc[0:0]
+    else:
+        ps, pe = prev_range
+        prev_filtered = _apply_data_filters(
+            df,
+            date_start=ps,
+            date_end=pe,
+            channels=channel_sel,
+            campaigns=campaign_sel,
+            roas_min=roas_min,
+            cpa_max=cpa_max,
+        )
+
     if filtered.empty:
         st.info("선택한 필터에 맞는 데이터가 없습니다.")
         return
 
-    tab_summary, tab_charts, tab_channel, tab_detail = st.tabs(["요약", "차트", "채널 요약", "상세"])
+    tab_dash, tab_summary, tab_charts, tab_channel, tab_detail = st.tabs(
+        ["대시보드", "요약", "차트", "채널 요약", "상세"]
+    )
 
     total_cost = int(filtered["cost"].sum())
     total_rev = int(filtered["revenue"].sum())
@@ -275,6 +484,12 @@ def render_dashboard(df: pd.DataFrame) -> None:
     ctr = (total_clicks / total_imp * 100) if total_imp else 0.0
     cvr = (total_conv / total_clicks * 100) if total_clicks else 0.0
     cpc = (total_cost / total_clicks) if total_clicks else 0.0
+
+    with tab_dash:
+        st.caption(
+            "KPI 증감률은 **동일한 일수**의 바로 이전 기간(전기간)과 비교합니다. 채널·캠페인·ROAS·CPA 필터를 동일하게 적용합니다."
+        )
+        render_tab_main_dashboard(filtered, prev_filtered)
 
     with tab_summary:
         r1 = st.columns(4)
