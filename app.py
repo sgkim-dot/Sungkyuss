@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -141,6 +141,73 @@ def render_login() -> None:
     st.rerun()
 
 
+PERIOD_PRESETS = ("전체", "최근7일", "최근14일", "이번주", "저번주")
+
+
+def _preset_date_range(preset: str, data_min: date, data_max: date) -> tuple[date, date]:
+    """데이터 범위와 겹치도록 기간 프리셋을 [시작, 종료] 날짜로 변환 (주 시작: 월요일)."""
+    if preset == "전체":
+        return data_min, data_max
+
+    today = date.today()
+    anchor = min(data_max, max(data_min, today))
+
+    if preset == "최근7일":
+        end, start = anchor, anchor - timedelta(days=6)
+    elif preset == "최근14일":
+        end, start = anchor, anchor - timedelta(days=13)
+    elif preset == "이번주":
+        mon = anchor - timedelta(days=anchor.weekday())
+        start, end = mon, mon + timedelta(days=6)
+    elif preset == "저번주":
+        this_mon = anchor - timedelta(days=anchor.weekday())
+        start = this_mon - timedelta(days=7)
+        end = start + timedelta(days=6)
+    else:
+        return data_min, data_max
+
+    start = max(start, data_min)
+    end = min(end, data_max)
+    if start > end:
+        return data_max, data_min
+    return start, end
+
+
+def _apply_data_filters(
+    df: pd.DataFrame,
+    *,
+    date_start: date,
+    date_end: date,
+    channels: list[str],
+    campaigns: list[str],
+    roas_min: float,
+    cpa_max: float | None,
+) -> pd.DataFrame:
+    out = df.copy()
+    if date_start > date_end:
+        return out.iloc[0:0]
+    out = out[(out["date"].dt.date >= date_start) & (out["date"].dt.date <= date_end)]
+    if not channels:
+        return out.iloc[0:0]
+    out = out[out["channel"].isin(channels)]
+    if not campaigns:
+        return out.iloc[0:0]
+    out = out[out["campaign"].isin(campaigns)]
+
+    out = out.assign(_row_roas=0.0)
+    m_cost = out["cost"] > 0
+    out.loc[m_cost, "_row_roas"] = out.loc[m_cost, "revenue"] / out.loc[m_cost, "cost"]
+    out = out[out["_row_roas"] >= roas_min].drop(columns="_row_roas")
+
+    if cpa_max is not None and cpa_max > 0:
+        out = out.assign(_cpa=float("inf"))
+        m_conv = out["conversions"] > 0
+        out.loc[m_conv, "_cpa"] = out.loc[m_conv, "cost"] / out.loc[m_conv, "conversions"]
+        out = out[(out["conversions"] == 0) | (out["_cpa"] <= cpa_max)].drop(columns="_cpa")
+
+    return out
+
+
 def render_dashboard(df: pd.DataFrame) -> None:
     st.title("마케팅 성과 대시보드")
 
@@ -158,30 +225,46 @@ def render_dashboard(df: pd.DataFrame) -> None:
             logout()
         st.divider()
         st.header("필터")
+
+        period_preset = st.selectbox("기간 프리셋", PERIOD_PRESETS, index=0)
+        date_start, date_end = _preset_date_range(period_preset, min_d, max_d)
+        st.caption(f"적용 기간: **{date_start}** ~ **{date_end}**")
+
         channel_sel = st.multiselect("채널", options=channels, default=channels)
-        all_campaigns = sorted(df["campaign"].unique().tolist())
-        campaign_sel = st.multiselect("캠페인", options=all_campaigns, default=all_campaigns)
-        date_range = st.date_input("기간", value=(min_d, max_d), min_value=min_d, max_value=max_d)
 
-    filtered = df.copy()
-    if channel_sel:
-        filtered = filtered[filtered["channel"].isin(channel_sel)]
-    else:
-        filtered = filtered.iloc[0:0]
-    if campaign_sel:
-        filtered = filtered[filtered["campaign"].isin(campaign_sel)]
-    else:
-        filtered = filtered.iloc[0:0]
+        sub = df[df["channel"].isin(channel_sel)] if channel_sel else df.iloc[0:0]
+        campaign_options = sorted(sub["campaign"].unique().tolist()) if not sub.empty else []
+        campaign_sel = st.multiselect(
+            "캠페인 (선택 채널 기준)",
+            options=campaign_options,
+            default=campaign_options,
+        )
 
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start, end = date_range
-        filtered = filtered[(filtered["date"].dt.date >= start) & (filtered["date"].dt.date <= end)]
-    elif hasattr(date_range, "year"):
-        filtered = filtered[filtered["date"].dt.date == date_range]
+        roas_min = st.slider("ROAS 최소", min_value=0.0, max_value=800.0, value=0.0, step=0.5)
+        cpa_max_input = st.number_input(
+            "CPA 최대 (원)",
+            min_value=0,
+            value=0,
+            step=1000,
+            help="0이면 CPA 필터를 적용하지 않습니다.",
+        )
+        cpa_max = float(cpa_max_input) if cpa_max_input > 0 else None
+
+    filtered = _apply_data_filters(
+        df,
+        date_start=date_start,
+        date_end=date_end,
+        channels=channel_sel,
+        campaigns=campaign_sel,
+        roas_min=roas_min,
+        cpa_max=cpa_max,
+    )
 
     if filtered.empty:
         st.info("선택한 필터에 맞는 데이터가 없습니다.")
         return
+
+    tab_summary, tab_charts, tab_channel, tab_detail = st.tabs(["요약", "차트", "채널 요약", "상세"])
 
     total_cost = int(filtered["cost"].sum())
     total_rev = int(filtered["revenue"].sum())
@@ -193,73 +276,77 @@ def render_dashboard(df: pd.DataFrame) -> None:
     cvr = (total_conv / total_clicks * 100) if total_clicks else 0.0
     cpc = (total_cost / total_clicks) if total_clicks else 0.0
 
-    r1 = st.columns(4)
-    r1[0].metric("총 비용", f"{total_cost:,}원")
-    r1[1].metric("총 매출", f"{total_rev:,}원")
-    r1[2].metric("ROAS", f"{roas:.2f}")
-    r1[3].metric("노출", f"{total_imp:,}")
+    with tab_summary:
+        r1 = st.columns(4)
+        r1[0].metric("총 비용", f"{total_cost:,}원")
+        r1[1].metric("총 매출", f"{total_rev:,}원")
+        r1[2].metric("ROAS", f"{roas:.2f}")
+        r1[3].metric("노출", f"{total_imp:,}")
 
-    r2 = st.columns(5)
-    r2[0].metric("클릭", f"{total_clicks:,}")
-    r2[1].metric("CTR", f"{ctr:.2f}%")
-    r2[2].metric("전환", f"{total_conv:,}")
-    r2[3].metric("CVR", f"{cvr:.2f}%")
-    r2[4].metric("평균 CPC", f"{cpc:,.0f}원")
+        r2 = st.columns(5)
+        r2[0].metric("클릭", f"{total_clicks:,}")
+        r2[1].metric("CTR", f"{ctr:.2f}%")
+        r2[2].metric("전환", f"{total_conv:,}")
+        r2[3].metric("CVR", f"{cvr:.2f}%")
+        r2[4].metric("평균 CPC", f"{cpc:,.0f}원")
 
-    st.subheader("일별 비용·매출 추이")
-    _fd = filtered.assign(_day=filtered["date"].dt.date)
-    daily = (
-        _fd.groupby("_day", as_index=False)
-        .agg(cost=("cost", "sum"), revenue=("revenue", "sum"))
-        .rename(columns={"_day": "날짜"})
-        .set_index("날짜")
-    )
-    st.line_chart(daily)
-
-    cleft, cright = st.columns(2)
-    with cleft:
-        st.subheader("채널별 비용")
-        by_ch = filtered.groupby("channel", as_index=False)["cost"].sum().sort_values("cost", ascending=False)
-        st.bar_chart(by_ch.set_index("channel"))
-    with cright:
-        st.subheader("캠페인별 매출 (상위 10)")
-        top_c = (
-            filtered.groupby("campaign", as_index=False)["revenue"]
-            .sum()
-            .sort_values("revenue", ascending=False)
-            .head(10)
+    with tab_charts:
+        st.subheader("일별 비용·매출 추이")
+        _fd = filtered.assign(_day=filtered["date"].dt.date)
+        daily = (
+            _fd.groupby("_day", as_index=False)
+            .agg(cost=("cost", "sum"), revenue=("revenue", "sum"))
+            .rename(columns={"_day": "날짜"})
+            .set_index("날짜")
         )
-        st.bar_chart(top_c.set_index("campaign"))
+        st.line_chart(daily)
 
-    st.subheader("채널 요약")
-    ch_agg = filtered.groupby("channel", as_index=False).agg(
-        impressions=("impressions", "sum"),
-        clicks=("clicks", "sum"),
-        cost=("cost", "sum"),
-        conversions=("conversions", "sum"),
-        revenue=("revenue", "sum"),
-    )
-    ch_agg["ROAS"] = (ch_agg["revenue"] / ch_agg["cost"]).replace([float("inf")], 0).fillna(0).round(2)
-    ch_agg["CTR_%"] = (ch_agg["clicks"] / ch_agg["impressions"] * 100).replace([float("inf")], 0).fillna(0).round(2)
-    ch_agg["CVR_%"] = (ch_agg["conversions"] / ch_agg["clicks"] * 100).replace([float("inf")], 0).fillna(0).round(2)
-    ch_agg = ch_agg.rename(
-        columns={
-            "channel": "채널",
-            "impressions": "노출",
-            "clicks": "클릭",
-            "cost": "비용",
-            "conversions": "전환",
-            "revenue": "매출",
-        }
-    )
-    st.dataframe(ch_agg, use_container_width=True, hide_index=True)
+        cleft, cright = st.columns(2)
+        with cleft:
+            st.subheader("채널별 비용")
+            by_ch = filtered.groupby("channel", as_index=False)["cost"].sum().sort_values("cost", ascending=False)
+            st.bar_chart(by_ch.set_index("channel"))
+        with cright:
+            st.subheader("캠페인별 매출 (상위 10)")
+            top_c = (
+                filtered.groupby("campaign", as_index=False)["revenue"]
+                .sum()
+                .sort_values("revenue", ascending=False)
+                .head(10)
+            )
+            st.bar_chart(top_c.set_index("campaign"))
 
-    st.subheader("원본 행")
-    st.dataframe(
-        filtered.sort_values(["date", "channel", "campaign"], ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+    with tab_channel:
+        st.subheader("채널 요약")
+        ch_agg = filtered.groupby("channel", as_index=False).agg(
+            impressions=("impressions", "sum"),
+            clicks=("clicks", "sum"),
+            cost=("cost", "sum"),
+            conversions=("conversions", "sum"),
+            revenue=("revenue", "sum"),
+        )
+        ch_agg["ROAS"] = (ch_agg["revenue"] / ch_agg["cost"]).replace([float("inf")], 0).fillna(0).round(2)
+        ch_agg["CTR_%"] = (ch_agg["clicks"] / ch_agg["impressions"] * 100).replace([float("inf")], 0).fillna(0).round(2)
+        ch_agg["CVR_%"] = (ch_agg["conversions"] / ch_agg["clicks"] * 100).replace([float("inf")], 0).fillna(0).round(2)
+        ch_agg = ch_agg.rename(
+            columns={
+                "channel": "채널",
+                "impressions": "노출",
+                "clicks": "클릭",
+                "cost": "비용",
+                "conversions": "전환",
+                "revenue": "매출",
+            }
+        )
+        st.dataframe(ch_agg, use_container_width=True, hide_index=True)
+
+    with tab_detail:
+        st.subheader("원본 행")
+        st.dataframe(
+            filtered.sort_values(["date", "channel", "campaign"], ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def main() -> None:
