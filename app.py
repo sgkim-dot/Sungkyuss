@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -400,6 +401,273 @@ def render_tab_main_dashboard(
         st.plotly_chart(fig_roas_bar, use_container_width=True)
 
 
+PIVOT_ROW_LABELS = ("채널", "캠페인", "날짜", "요일", "주차(ISO)", "월", "연도")
+PIVOT_ROW_COL = {
+    "채널": "channel",
+    "캠페인": "campaign",
+    "날짜": "피벗_날짜",
+    "요일": "피벗_요일",
+    "주차(ISO)": "피벗_주차",
+    "월": "피벗_월",
+    "연도": "피벗_연도",
+}
+PIVOT_COL_LABELS = ("없음", "요일", "주차(ISO)", "월", "연도")
+PIVOT_COL_MAP = {
+    "없음": None,
+    "요일": "피벗_요일",
+    "주차(ISO)": "피벗_주차",
+    "월": "피벗_월",
+    "연도": "피벗_연도",
+}
+PIVOT_VALUE_LABELS = (
+    "cost",
+    "revenue",
+    "impressions",
+    "clicks",
+    "conversions",
+    "roas",
+    "cpa",
+    "ctr",
+    "cvr",
+)
+PIVOT_VALUE_DISPLAY = {
+    "cost": "광고비",
+    "revenue": "매출",
+    "impressions": "노출",
+    "clicks": "클릭",
+    "conversions": "전환",
+    "roas": "ROAS",
+    "cpa": "CPA",
+    "ctr": "CTR (%)",
+    "cvr": "CVR (%)",
+}
+PIVOT_AGG_LABELS = ("합계", "평균", "최대", "최소")
+
+
+def _pivot_enrich(fr: pd.DataFrame) -> pd.DataFrame:
+    x = fr.copy()
+    x["피벗_날짜"] = x["date"].dt.date
+    wd_ko = ["월", "화", "수", "목", "금", "토", "일"]
+    x["피벗_요일"] = x["date"].dt.weekday.map(lambda i: wd_ko[int(i)])
+    iso = x["date"].dt.isocalendar()
+    x["피벗_주차"] = (
+        iso["year"].astype(str) + "-W" + iso["week"].astype(str).str.zfill(2)
+    )
+    x["피벗_월"] = x["date"].dt.to_period("M").astype(str)
+    x["피벗_연도"] = x["date"].dt.year.astype(str)
+    return x
+
+
+def _pivot_cell_value(g: pd.DataFrame, value: str, agg_ko: str) -> float:
+    if g.empty:
+        return float("nan")
+
+    if value in ("cost", "revenue", "impressions", "clicks", "conversions"):
+        s = g[value]
+        if agg_ko == "합계":
+            return float(s.sum())
+        if agg_ko == "평균":
+            return float(s.mean())
+        if agg_ko == "최대":
+            return float(s.max())
+        if agg_ko == "최소":
+            return float(s.min())
+        return float("nan")
+
+    if value == "roas":
+        if agg_ko == "합계":
+            c, r = g["cost"].sum(), g["revenue"].sum()
+            return float(r / c) if c else float("nan")
+        rr = g["revenue"] / g["cost"].replace(0, pd.NA)
+        if agg_ko == "평균":
+            return float(rr.mean()) if rr.notna().any() else float("nan")
+        if agg_ko == "최대":
+            return float(rr.max()) if rr.notna().any() else float("nan")
+        if agg_ko == "최소":
+            return float(rr.min()) if rr.notna().any() else float("nan")
+
+    if value == "cpa":
+        if agg_ko == "합계":
+            c, cv = g["cost"].sum(), g["conversions"].sum()
+            return float(c / cv) if cv else float("nan")
+        cc = g["cost"] / g["conversions"].replace(0, pd.NA)
+        if agg_ko == "평균":
+            return float(cc.mean()) if cc.notna().any() else float("nan")
+        if agg_ko == "최대":
+            return float(cc.max()) if cc.notna().any() else float("nan")
+        if agg_ko == "최소":
+            return float(cc.min()) if cc.notna().any() else float("nan")
+
+    if value == "ctr":
+        if agg_ko == "합계":
+            imp, cl = g["impressions"].sum(), g["clicks"].sum()
+            return float(100.0 * cl / imp) if imp else float("nan")
+        t = g["clicks"] / g["impressions"].replace(0, pd.NA) * 100.0
+        if agg_ko == "평균":
+            return float(t.mean()) if t.notna().any() else float("nan")
+        if agg_ko == "최대":
+            return float(t.max()) if t.notna().any() else float("nan")
+        if agg_ko == "최소":
+            return float(t.min()) if t.notna().any() else float("nan")
+
+    if value == "cvr":
+        if agg_ko == "합계":
+            cl, cv = g["clicks"].sum(), g["conversions"].sum()
+            return float(100.0 * cv / cl) if cl else float("nan")
+        t = g["conversions"] / g["clicks"].replace(0, pd.NA) * 100.0
+        if agg_ko == "평균":
+            return float(t.mean()) if t.notna().any() else float("nan")
+        if agg_ko == "최대":
+            return float(t.max()) if t.notna().any() else float("nan")
+        if agg_ko == "최소":
+            return float(t.min()) if t.notna().any() else float("nan")
+
+    return float("nan")
+
+
+def _pivot_build(
+    fr: pd.DataFrame,
+    *,
+    row_labels: list[str],
+    col_label: str,
+    value_key: str,
+    agg_ko: str,
+) -> tuple[pd.DataFrame, bool]:
+    """피벗 결과 테이블과 (열 있음 여부) 반환. 열 있으면 컬럼 피벗이 적용된 wide 형태."""
+    work = _pivot_enrich(fr)
+    row_cols = [PIVOT_ROW_COL[lb] for lb in row_labels]
+    col_dim = PIVOT_COL_MAP[col_label]
+    gb_keys = row_cols + ([col_dim] if col_dim else [])
+
+    def _agg_one(sub: pd.DataFrame) -> float:
+        return _pivot_cell_value(sub, value_key, agg_ko)
+
+    grouped = work.groupby(gb_keys, dropna=False)
+    try:
+        out = grouped.apply(_agg_one, include_groups=False)
+    except TypeError:
+        out = grouped.apply(_agg_one)
+    out.name = "값"
+
+    if col_dim is None:
+        tbl = out.reset_index()
+        for lb in row_labels:
+            tbl = tbl.rename(columns={PIVOT_ROW_COL[lb]: lb})
+        tbl["값"] = pd.to_numeric(tbl["값"], errors="coerce")
+        sort_cols = [c for c in tbl.columns if c != "값"]
+        tbl = tbl.sort_values(by=sort_cols if sort_cols else ["값"], ascending=True)
+        return tbl, False
+
+    s = out if isinstance(out, pd.Series) else pd.Series(out)
+    wide = s.unstack(level=-1)
+    wide = wide.sort_index(axis=0).sort_index(axis=1)
+    wide.columns = wide.columns.astype(str)
+    if col_label == "요일":
+        wd_order = ["월", "화", "수", "목", "금", "토", "일"]
+        ordered = [c for c in wd_order if c in wide.columns]
+        tail = [c for c in wide.columns if c not in set(wd_order)]
+        wide = wide[ordered + tail]
+    if wide.index.nlevels == 1:
+        wide.index.name = row_labels[0]
+    else:
+        wide.index.names = row_labels
+    wide.columns.name = col_label
+    return wide.astype(float), True
+
+
+def _pivot_to_csv_bytes(tbl: pd.DataFrame, wide: bool) -> bytes:
+    buf = io.StringIO()
+    if wide:
+        tbl.to_csv(buf, encoding="utf-8")
+    else:
+        tbl.to_csv(buf, index=False, encoding="utf-8")
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def render_tab_pivot(filtered: pd.DataFrame) -> None:
+    st.subheader("피벗 분석")
+    st.caption(
+        "행·열·값·집계를 선택해 엑셀 피벗과 비슷하게 요약합니다. "
+        "ROAS/CPA/CTR/CVR의 「합계」는 그룹 내 합산 지표 기준 비율(가중)입니다."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        row_sel = st.multiselect(
+            "행",
+            options=list(PIVOT_ROW_LABELS),
+            default=["채널", "캠페인"],
+            key="pivot_rows",
+        )
+    with c2:
+        col_sel = st.selectbox("열", options=list(PIVOT_COL_LABELS), index=0, key="pivot_col")
+    with c3:
+        val_display = st.selectbox(
+            "값",
+            options=list(PIVOT_VALUE_DISPLAY.keys()),
+            format_func=lambda k: PIVOT_VALUE_DISPLAY[k],
+            index=1,
+            key="pivot_value",
+        )
+    with c4:
+        agg_sel = st.selectbox("집계", options=list(PIVOT_AGG_LABELS), index=0, key="pivot_agg")
+
+    if not row_sel:
+        st.warning("행을 하나 이상 선택하세요.")
+        return
+
+    try:
+        tbl, is_wide = _pivot_build(
+            filtered,
+            row_labels=row_sel,
+            col_label=col_sel,
+            value_key=val_display,
+            agg_ko=agg_sel,
+        )
+    except Exception as e:
+        st.error(f"피벗 생성 중 오류: {e}")
+        return
+
+    if is_wide:
+        z = tbl.to_numpy(dtype=float)
+        x_labels = [str(c) for c in tbl.columns.tolist()]
+        y_labels = []
+        for row in tbl.index:
+            y_labels.append(
+                " | ".join(str(x) for x in (row if isinstance(row, tuple) else (row,)))
+            )
+        fig_h = go.Figure(
+            data=go.Heatmap(
+                z=z,
+                x=x_labels,
+                y=y_labels,
+                colorscale="Blues",
+                hoverongaps=False,
+                colorbar=dict(title=PIVOT_VALUE_DISPLAY[val_display]),
+            )
+        )
+        ttl = f"{PIVOT_VALUE_DISPLAY[val_display]} ({agg_sel}) — 히트맵"
+        fig_h.update_layout(
+            title=ttl,
+            margin=dict(l=8, r=8, t=48, b=8),
+            height=max(400, min(900, 28 * len(y_labels) + 120)),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_h, use_container_width=True)
+        csv_bytes = _pivot_to_csv_bytes(tbl, wide=True)
+    else:
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+        csv_bytes = _pivot_to_csv_bytes(tbl, wide=False)
+
+    st.download_button(
+        label="CSV 다운로드",
+        data=csv_bytes,
+        file_name=f"pivot_{val_display}_{agg_sel}.csv",
+        mime="text/csv",
+        key="pivot_csv_dl",
+    )
+
+
 def render_dashboard(df: pd.DataFrame) -> None:
     st.title("마케팅 성과 대시보드")
 
@@ -471,8 +739,8 @@ def render_dashboard(df: pd.DataFrame) -> None:
         st.info("선택한 필터에 맞는 데이터가 없습니다.")
         return
 
-    tab_dash, tab_summary, tab_charts, tab_channel, tab_detail = st.tabs(
-        ["대시보드", "요약", "차트", "채널 요약", "상세"]
+    tab_dash, tab_summary, tab_charts, tab_channel, tab_pivot, tab_detail = st.tabs(
+        ["대시보드", "요약", "차트", "채널 요약", "피벗", "상세"]
     )
 
     total_cost = int(filtered["cost"].sum())
@@ -554,6 +822,9 @@ def render_dashboard(df: pd.DataFrame) -> None:
             }
         )
         st.dataframe(ch_agg, use_container_width=True, hide_index=True)
+
+    with tab_pivot:
+        render_tab_pivot(filtered)
 
     with tab_detail:
         st.subheader("원본 행")
