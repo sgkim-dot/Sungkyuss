@@ -668,6 +668,120 @@ def render_tab_pivot(filtered: pd.DataFrame) -> None:
     )
 
 
+RANKING_PRESETS = (
+    "ROAS TOP 10",
+    "ROAS BOTTOM 10",
+    "광고비 TOP 10",
+    "전환수 TOP 10",
+    "CPA 효율 TOP 10",
+)
+
+
+def _ranking_campaign_agg(fr: pd.DataFrame) -> pd.DataFrame:
+    if fr.empty:
+        return pd.DataFrame()
+    g = fr.groupby(["channel", "campaign"], as_index=False).agg(
+        광고비=("cost", "sum"),
+        매출=("revenue", "sum"),
+        전환수=("conversions", "sum"),
+        노출=("impressions", "sum"),
+        클릭=("clicks", "sum"),
+    )
+    g["ROAS"] = g["매출"] / g["광고비"].replace(0, pd.NA)
+    g["CPA"] = g["광고비"] / g["전환수"].replace(0, pd.NA)
+    g["CTR (%)"] = g["클릭"] / g["노출"].replace(0, pd.NA) * 100.0
+    g["CVR (%)"] = g["전환수"] / g["클릭"].replace(0, pd.NA) * 100.0
+    return g.rename(columns={"channel": "채널", "campaign": "캠페인"})
+
+
+def _ranking_apply_preset(base: pd.DataFrame, preset: str) -> pd.DataFrame:
+    if base.empty:
+        return base
+    if preset == "ROAS TOP 10":
+        m = base["광고비"] > 0
+        return base.loc[m].nlargest(10, "ROAS")
+    if preset == "ROAS BOTTOM 10":
+        m = base["광고비"] > 0
+        sub = base.loc[m].dropna(subset=["ROAS"])
+        return sub.nsmallest(10, "ROAS")
+    if preset == "광고비 TOP 10":
+        return base.nlargest(10, "광고비")
+    if preset == "전환수 TOP 10":
+        return base.nlargest(10, "전환수")
+    if preset == "CPA 효율 TOP 10":
+        m = base["전환수"] > 0
+        sub = base.loc[m].dropna(subset=["CPA"])
+        return sub.nsmallest(10, "CPA")
+    return base
+
+
+def _style_roas_column(col: pd.Series) -> list[str]:
+    styles: list[str] = []
+    for v in col:
+        if pd.isna(v):
+            styles.append("background-color: #e9ecef; color: #495057")
+        elif v >= 4.0:
+            styles.append("background-color: #c6efce")
+        elif v >= 2.0:
+            styles.append("background-color: #ffeb9c")
+        else:
+            styles.append("background-color: #ffc7ce")
+    return styles
+
+
+def _ranking_styler(out: pd.DataFrame):
+    show_cols = [
+        "채널",
+        "캠페인",
+        "광고비",
+        "매출",
+        "ROAS",
+        "전환수",
+        "CPA",
+        "CTR (%)",
+        "CVR (%)",
+    ]
+    disp = out[show_cols].copy()
+    styler = disp.style.apply(_style_roas_column, subset=["ROAS"], axis=0)
+    styler = styler.format(
+        {
+            "광고비": lambda x: f"{x:,.0f}원" if pd.notna(x) else "—",
+            "매출": lambda x: f"{x:,.0f}원" if pd.notna(x) else "—",
+            "ROAS": lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "—",
+            "CPA": lambda x: f"{x:,.0f}원" if pd.notna(x) else "—",
+            "CTR (%)": lambda x: f"{x:.1f}%" if pd.notna(x) else "—",
+            "CVR (%)": lambda x: f"{x:.1f}%" if pd.notna(x) else "—",
+            "전환수": lambda x: f"{int(x):,}" if pd.notna(x) else "—",
+        },
+        na_rep="—",
+    )
+    try:
+        return styler.hide(axis="index")
+    except TypeError:
+        return styler.hide_index()
+
+
+def render_tab_ranking(filtered: pd.DataFrame) -> None:
+    st.subheader("성과 랭킹")
+    st.caption(
+        "채널·캠페인 단위로 집계한 뒤 프리셋에 따라 상·하위 10건을 표시합니다. "
+        "ROAS 조건부 서식: **400% 이상** 초록, **200~400% 미만** 노랑, **200% 미만** 빨강 (매출÷광고비 비율 기준)."
+    )
+    preset = st.selectbox("랭킹 프리셋", RANKING_PRESETS, key="ranking_preset")
+
+    base = _ranking_campaign_agg(filtered)
+    if base.empty:
+        st.info("표시할 데이터가 없습니다.")
+        return
+
+    ranked = _ranking_apply_preset(base, preset)
+    if ranked.empty:
+        st.info("이 프리셋에 맞는 행이 없습니다. (예: CPA 효율은 전환이 있는 캠페인만 해당)")
+        return
+
+    st.dataframe(_ranking_styler(ranked), use_container_width=True, hide_index=True)
+
+
 def render_dashboard(df: pd.DataFrame) -> None:
     st.title("마케팅 성과 대시보드")
 
@@ -739,8 +853,8 @@ def render_dashboard(df: pd.DataFrame) -> None:
         st.info("선택한 필터에 맞는 데이터가 없습니다.")
         return
 
-    tab_dash, tab_summary, tab_charts, tab_channel, tab_pivot, tab_detail = st.tabs(
-        ["대시보드", "요약", "차트", "채널 요약", "피벗", "상세"]
+    tab_dash, tab_summary, tab_charts, tab_channel, tab_pivot, tab_rank, tab_detail = st.tabs(
+        ["대시보드", "요약", "차트", "채널 요약", "피벗", "성과 랭킹", "상세"]
     )
 
     total_cost = int(filtered["cost"].sum())
@@ -825,6 +939,9 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
     with tab_pivot:
         render_tab_pivot(filtered)
+
+    with tab_rank:
+        render_tab_ranking(filtered)
 
     with tab_detail:
         st.subheader("원본 행")
